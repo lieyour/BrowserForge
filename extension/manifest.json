@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "BrowserForge",
+  "version": "0.1.0",
+  "description": "Create a reusable BrowserForge Skill from the current form.",
+  "permissions": ["activeTab", "scripting", "tabs"],
+  "host_permissions": ["http://127.0.0.1:8787/*"],
+  "action": {
+    "default_title": "Create BrowserForge Skill",
+    "default_popup": "popup.html"
+  }
+}

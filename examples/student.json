@@ -1,0 +1,10 @@
+{
+  "firstName": "Ada",
+  "email": "ada@example.test",
+  "mobile": "1380013800",
+  "birthDate": "1990-12-10",
+  "gender": "Female",
+  "hobbies": ["Music", "Sports"],
+  "subject": "Maths",
+  "address": "1 Analytical Engine Way"
+}
