@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Guarded write fixture</title></head>
+<body>
+  <form id="order-form">
+    <label>Item <input name="item" data-testid="item" required></label>
+    <label>Quantity <input name="quantity" type="number" min="1" required></label>
+    <label>Priority
+      <select name="priority" data-testid="priority">
+        <option value="normal">Normal</option>
+        <option value="high">High priority</option>
+      </select>
+    </label>
+    <label><input name="expedited" type="checkbox" data-testid="expedited"> Expedited</label>
+    <button type="submit" data-testid="submit">Create fixture order</button>
+  </form>
+  <p data-testid="validation-error" hidden>Validation failed</p>
+  <p data-testid="failure" hidden>Fixture order failed</p>
+  <p data-testid="success" hidden>Fixture order created</p>
+  <p data-testid="submit-count">0</p>
+  <script>
+    window.browserForgeSubmitCount = 0;
+    document.querySelector("#order-form").addEventListener("submit", function(event) {
+      event.preventDefault();
+      window.browserForgeSubmitCount++;
+      document.querySelector('[data-testid="submit-count"]').textContent = String(window.browserForgeSubmitCount);
+      var scenario = new URL(location.href).searchParams.get("scenario");
+      if (scenario === "success") document.querySelector('[data-testid="success"]').hidden = false;
+      if (scenario === "validation") document.querySelector('[data-testid="validation-error"]').hidden = false;
+      if (scenario === "failure") document.querySelector('[data-testid="failure"]').hidden = false;
+      if (scenario === "navigation") history.pushState({}, "", "/left-before-evidence");
+    });
+  </script>
+</body>
+</html>

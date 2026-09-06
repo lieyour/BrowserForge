@@ -1,10 +1,13 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { resolve } from "node:path";
+import { BrowserBridge } from "./bridge.js";
+import { locateAction, parseActionReference, resolveActionRoute } from "./actionRegistry.js";
 import { compileSkill } from "./compiler/skillCompiler.js";
 import type { FormExploration } from "./contracts/skill.js";
 import { generateSkillWithResponses, type PageSnapshot } from "./generator/responsesClient.js";
-import { exploreSiteFlow, flowLimits } from "./generator/flowExplorer.js";
+import { exploreSiteFlow, flowOptions } from "./generator/flowExplorer.js";
 import { loadSkillPackage, mergeSkillPackages, validateSkillPackage, writeSkillPackage, type ExistingSkillPackage } from "./generator/skillPackage.js";
+import { validateActionInput } from "./readAction.js";
 
 const bodyLimit = 5_000_000;
 
@@ -55,7 +58,9 @@ function isSnapshot(value: unknown): value is PageSnapshot {
     const url = new URL(snapshot.url);
     if (!["http:", "https:"].includes(url.protocol)) return false;
   } catch { return false; }
-  return snapshot.visibleText.length <= 20_000 && snapshot.elements.length <= 300 && (!snapshot.screenshot || (typeof snapshot.screenshot === "string" && snapshot.screenshot.startsWith("data:image/jpeg;base64,") && snapshot.screenshot.length <= 4_000_000));
+  return snapshot.visibleText.length <= 20_000 && snapshot.elements.length <= 300
+    && (snapshot.generationMode === undefined || snapshot.generationMode === "read" || snapshot.generationMode === "write")
+    && (!snapshot.screenshot || (typeof snapshot.screenshot === "string" && snapshot.screenshot.startsWith("data:image/jpeg;base64,") && snapshot.screenshot.length <= 4_000_000));
 }
 
 function isFlowRequest(value: unknown): value is { startUrl: string } {
@@ -63,18 +68,91 @@ function isFlowRequest(value: unknown): value is { startUrl: string } {
   try { return ["http:", "https:"].includes(new URL((value as { startUrl: string }).startUrl).protocol); } catch { return false; }
 }
 
+function actionRequest(value: unknown): value is { domain: string; action: string; input: unknown; toolName?: string; mode?: "read" | "write" } {
+  return !!value && typeof value === "object" && typeof (value as Record<string, unknown>).domain === "string" && typeof (value as Record<string, unknown>).action === "string" && "input" in value
+    && ((value as Record<string, unknown>).toolName === undefined || typeof (value as Record<string, unknown>).toolName === "string")
+    && ((value as Record<string, unknown>).mode === undefined || (value as Record<string, unknown>).mode === "read" || (value as Record<string, unknown>).mode === "write");
+}
+
+function bridgeResult(value: unknown): value is { taskId: string; ok: boolean; data?: unknown; durationMs?: number; error?: string | { code: string; message: string } } {
+  if (!value || typeof value !== "object") return false;
+  const result = value as Record<string, unknown>;
+  if (typeof result.taskId !== "string" || typeof result.ok !== "boolean") return false;
+  if (result.durationMs !== undefined && (typeof result.durationMs !== "number" || !Number.isFinite(result.durationMs) || result.durationMs < 0)) return false;
+  if (result.error === undefined || typeof result.error === "string") return true;
+  return !!result.error && typeof result.error === "object" && typeof (result.error as Record<string, unknown>).code === "string" && typeof (result.error as Record<string, unknown>).message === "string";
+}
+
 export type SkillRecognizer = (snapshot: PageSnapshot, existing?: ExistingSkillPackage) => Promise<unknown>;
 
 export function createBrowserForgeServer(workspace = process.cwd(), recognize: SkillRecognizer = generateSkillWithResponses) {
+  const bridge = new BrowserBridge();
   return createServer(async (request, response) => {
     const origin = extensionOrigin(request);
-    const requestPath = request.url ?? "";
+    const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+    const requestPath = requestUrl.pathname;
     if (request.method === "OPTIONS") {
       response.writeHead(204, origin ? { "access-control-allow-origin": origin, "access-control-allow-methods": "POST, OPTIONS", "access-control-allow-headers": "content-type", vary: "Origin" } : {});
       response.end();
       return;
     }
     if (request.method === "GET" && requestPath === "/health") return send(response, 200, { ok: true }, origin);
+    if (request.method === "GET" && requestPath === "/api/actions") {
+      try {
+        const domain = requestUrl.searchParams.get("domain");
+        if (!domain) return send(response, 400, { error: "domain is required" });
+        const skill = await loadSkillPackage(domain, workspace);
+        if (!skill) return send(response, 404, { error: `Skill ${domain} was not found` });
+        const actions = skill.references.map((reference) => {
+          const name = reference.filename.replace(/\.md$/, "");
+          try {
+            const { action } = parseActionReference(reference.content, name);
+            return { name, description: action.description, mode: action.mode, risk: action.risk, published: action.published, toolName: action.toolName, contractVersion: action.contractVersion, scope: action.scope, inputSchema: action.inputSchema, outputSchema: action.outputSchema, maxOutputChars: action.maxOutputChars, runnable: true };
+          } catch (error) {
+            return { name, runnable: false, error: error instanceof Error ? error.message : "Invalid reference" };
+          }
+        });
+        return send(response, 200, { ok: true, domain, actions });
+      } catch (error) { return send(response, 400, { error: error instanceof Error ? error.message : "Could not list actions" }); }
+    }
+    if (request.method === "POST" && requestPath === "/api/bridge/poll") {
+      if (!origin) return send(response, 403, { error: "Only the BrowserForge extension may use the bridge" });
+      try { await requestJson(request); } catch { /* polling payload is intentionally ignored */ }
+      return send(response, 200, bridge.poll() ?? { type: "idle" }, origin);
+    }
+    if (request.method === "POST" && requestPath === "/api/bridge/result") {
+      if (!origin) return send(response, 403, { error: "Only the BrowserForge extension may use the bridge" });
+      try {
+        const body = await requestJson(request);
+        if (!bridgeResult(body)) return send(response, 400, { error: "Invalid bridge result" }, origin);
+        const completed = bridge.complete(body.taskId, body);
+        return send(response, completed ? 200 : 404, { ok: completed }, origin);
+      } catch (error) { return send(response, 400, { error: error instanceof Error ? error.message : "Invalid bridge result" }, origin); }
+    }
+    if (request.method === "POST" && requestPath === "/api/actions/run") {
+      const startedAt = Date.now();
+      let invocation: { tool: string; domain: string; action: string; durationMs: number; actionDurationMs?: number; bridgeWaitMs?: number } | undefined;
+      try {
+        const body = await requestJson(request);
+        if (!actionRequest(body)) return send(response, 400, { error: "domain, action, and input are required" });
+        const { action } = await locateAction(workspace, body.domain, body.action);
+        if (body.mode !== undefined && body.mode !== action.mode) throw new Error(`Action mode mismatch: expected ${body.mode}, found ${action.mode}`);
+        if (body.toolName !== undefined && body.toolName !== action.toolName) throw new Error("Named tool does not match the requested action");
+        const input = validateActionInput(action.inputSchema, body.input);
+        invocation = { tool: body.toolName || (action.mode === "write" ? "browserforge_run_write_action" : "browserforge_run_read_action"), domain: body.domain, action: body.action, durationMs: 0 };
+        const bridgeStartedAt = Date.now();
+        const result = await bridge.run(resolveActionRoute(action, input), input);
+        const bridgeRoundTripMs = Date.now() - bridgeStartedAt;
+        invocation.actionDurationMs = result.actionDurationMs;
+        invocation.bridgeWaitMs = Math.max(0, bridgeRoundTripMs - (result.actionDurationMs ?? 0));
+        invocation.durationMs = Date.now() - startedAt;
+        return send(response, 200, { ok: true, data: result.data, invocation });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Could not run action";
+        if (invocation) invocation.durationMs = Date.now() - startedAt;
+        return send(response, /not connected/.test(message) ? 503 : 400, { ok: false, error: message, ...((error as Error & { code?: string }).code ? { code: (error as Error & { code?: string }).code } : {}), ...(invocation ? { invocation } : {}) });
+      }
+    }
     if (request.method !== "POST" || !["/api/compile", "/api/generate", "/api/generate-flow"].includes(requestPath)) return send(response, 404, { error: "Not found" }, origin);
     if (!origin) return send(response, 403, { error: "Only the BrowserForge extension may call this endpoint" });
     try {
@@ -99,7 +177,7 @@ export function createBrowserForgeServer(workspace = process.cwd(), recognize: S
           }
         }
         const location = await loadSkillPackage(domain, workspace);
-        return send(response, 201, { ok: true, skill: { directory: location?.directory, actions: location?.references.map((reference) => reference.filename.replace(/\.md$/, "")) ?? [], added: [...added], updated: [...updated], mode: "flow" }, flow: { visited: flow.pages.length, limits: { pages: flowLimits.maxPages, depth: flowLimits.maxDepth, durationMs: flowLimits.timeoutMs }, skipped: flow.skipped } }, origin);
+        return send(response, 201, { ok: true, skill: { directory: location?.directory, actions: location?.references.map((reference) => reference.filename.replace(/\.md$/, "")) ?? [], added: [...added], updated: [...updated], mode: "flow" }, flow: { visited: flow.pages.length, spaRoutes: flow.spaRoutes, limits: { pages: null, depth: null, durationMs: null, pageTimeoutMs: flowOptions.pageTimeoutMs }, skipped: flow.skipped } }, origin);
       }
       if (requestPath === "/api/generate") {
         if (!isSnapshot(body)) return send(response, 400, { error: "Invalid page snapshot" }, origin);
